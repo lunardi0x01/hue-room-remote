@@ -74,8 +74,13 @@ plugin so no auth token is left behind.
   is read from `/api/config` and saved as `bridgeId` in `hue.json`; requests
   are then addressed to that ID so the bridge certificate's hostname is
   matched, while the connection itself goes straight to the bridge's IP.
-- Automatic discovery uses Philips' hosted lookup once; pass an IP directly
-  to `pair.sh` to skip it.
+- Automatic discovery uses Philips' hosted lookup when pairing (and for the
+  IP recovery below); pass an IP directly to `pair.sh` to skip it.
+- If the bridge stops answering at its saved IP (a DHCP lease change), the
+  helper asks the discovery service where that `bridgeId` lives now, retries
+  there, and rewrites `bridgeIp` in `hue.json` only after the retry passes
+  TLS verification. Lookups are limited to one per minute; without a
+  `bridgeId` nothing is rediscovered.
 - If `bridgeId` is missing (e.g. from an older config), the panel warns
   "TLS verification disabled" — re-run `pair.sh` to restore full
   certificate verification.

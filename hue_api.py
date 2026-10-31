@@ -4,6 +4,7 @@ the username in process arguments."""
 
 import contextlib
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import stat
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 
 def _xdg_state_home():
@@ -46,6 +48,11 @@ CACERT = _resolve_cacert(CONFIG_HOME)
 MAX_CREDS_BYTES = 4096
 MAX_ORDER_BYTES = 65536
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_DISCOVERY_BYTES = 64 * 1024
+DISCOVERY_URL = "https://discovery.meethue.com/"
+# A dead bridge would otherwise ask Philips' discovery service on every
+# panel poll; one lookup a minute is plenty to notice a new address.
+DISCOVERY_COOLDOWN_SECONDS = 60
 
 _opener = None
 _no_redirect_opener = None
@@ -235,30 +242,104 @@ def _dispatch(op):
     # `except Exception: pass` instead of being caught by it.
     try:
         creds = _load_creds()
-
-        if op == "get-lights":
-            print(json.dumps(_request("/lights", creds)))
-        elif op == "get-groups":
-            print(json.dumps(_request("/groups", creds)))
-        elif op == "get-scenes":
-            print(json.dumps(_request("/scenes", creds)))
-        elif op == "put-light" and len(sys.argv) >= 4:
-            light_id = sys.argv[2]
-            if not re.fullmatch(r'[0-9]+', light_id):
-                return
-            state = json.loads(sys.argv[3])
-            _put(creds, "/lights/%s/state" % light_id, state)
-        elif op == "put-group" and len(sys.argv) >= 4:
-            group_id = sys.argv[2]
-            if not re.fullmatch(r'[0-9]+', group_id):
-                return
-            action = json.loads(sys.argv[3])
-            _put(creds, "/groups/%s/action" % group_id, action)
-        elif op == "verify":
-            lights = _request("/lights", creds)
-            print(len(lights))
     except Exception:
         sys.exit(1)
+
+    try:
+        try:
+            _run_bridge_op(op, creds)
+        except Exception as e:
+            if not _is_unreachable(e):
+                raise
+            # The bridge didn't answer where hue.json says it lives -- a
+            # DHCP lease change is the usual cause. Ask the discovery
+            # service where it is now and retry there; the address is only
+            # saved once the retry has gone through TLS verification.
+            new_ip = _rediscover_bridge_ip(creds)
+            if not new_ip:
+                raise
+            _run_bridge_op(op, dict(creds, bridgeIp=new_ip))
+            _save_bridge_ip(new_ip)
+    except Exception:
+        sys.exit(1)
+
+
+def _run_bridge_op(op, creds):
+    if op == "get-lights":
+        print(json.dumps(_request("/lights", creds)))
+    elif op == "get-groups":
+        print(json.dumps(_request("/groups", creds)))
+    elif op == "get-scenes":
+        print(json.dumps(_request("/scenes", creds)))
+    elif op == "put-light" and len(sys.argv) >= 4:
+        light_id = sys.argv[2]
+        if not re.fullmatch(r'[0-9]+', light_id):
+            return
+        state = json.loads(sys.argv[3])
+        _put(creds, "/lights/%s/state" % light_id, state)
+    elif op == "put-group" and len(sys.argv) >= 4:
+        group_id = sys.argv[2]
+        if not re.fullmatch(r'[0-9]+', group_id):
+            return
+        action = json.loads(sys.argv[3])
+        _put(creds, "/groups/%s/action" % group_id, action)
+    elif op == "verify":
+        lights = _request("/lights", creds)
+        print(len(lights))
+
+
+def _is_unreachable(exc):
+    # Nothing (or the wrong thing) answered at the saved address: refused,
+    # timed out, no route, or a TLS handshake that isn't the bridge. An
+    # HTTP status means the bridge itself replied, so the address is fine.
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    return isinstance(exc, (urllib.error.URLError, OSError))
+
+
+def _discovery_due():
+    stamp = os.path.join(STATE_HOME, "omarchy/settings/hue-discovery.stamp")
+    try:
+        if time.time() - os.stat(stamp).st_mtime < DISCOVERY_COOLDOWN_SECONDS:
+            return False
+    except OSError:
+        pass
+    try:
+        _atomic_write(stamp, "")
+    except OSError:
+        pass
+    return True
+
+
+def _rediscover_bridge_ip(creds):
+    # Without a bridgeId there is no hostname to verify the new address
+    # against, so an unverified guess is never saved.
+    bridge_id = _read_bridge_id(creds)
+    if not bridge_id or not _discovery_due():
+        return None
+    try:
+        with urllib.request.urlopen(DISCOVERY_URL, timeout=5) as r:
+            entries = _read_json_capped(r, MAX_DISCOVERY_BYTES)
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("id", "")).strip().lower() != bridge_id:
+                continue
+            ip = ipaddress.ip_address(str(entry.get("internalipaddress", "")))
+            if ip.version == 4 and ip.is_private and \
+                    str(ip) != creds.get("bridgeIp"):
+                return str(ip)
+    except Exception:
+        pass
+    return None
+
+
+def _save_bridge_ip(ip):
+    # Re-read so only bridgeIp changes; the lock-free read-modify-write is
+    # fine for a file the panel never writes concurrently.
+    creds = _load_creds()
+    creds["bridgeIp"] = ip
+    _atomic_write(CREDS_FILE, json.dumps(creds, indent=2) + "\n")
 
 
 def _open_checked_dir(directory):

@@ -929,5 +929,112 @@ class MainDispatchTests(unittest.TestCase):
             dispatch.assert_not_called()
 
 
+class RediscoveryTests(unittest.TestCase):
+    BRIDGE_ID = "ecb5fafffe028ff0"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        creds = os.path.join(self.tmp.name, "omarchy/settings/hue.json")
+        os.makedirs(os.path.dirname(creds))
+        self.creds_path = creds
+        self.write_creds({"bridgeIp": "192.168.1.4", "bridgeId": self.BRIDGE_ID,
+                          "username": "u"})
+        for name, value in (("STATE_HOME", self.tmp.name), ("CREDS_FILE", creds)):
+            p = mock.patch.object(hue_api, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def write_creds(self, creds):
+        with open(self.creds_path, "w") as f:
+            json.dump(creds, f)
+
+    def discovery(self, entries):
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.read.return_value = json.dumps(entries).encode()
+        return mock.patch.object(hue_api.urllib.request, "urlopen", return_value=resp)
+
+    def creds(self):
+        return hue_api._load_creds()
+
+    def test_unreachable_covers_connection_failures_not_http_replies(self):
+        self.assertTrue(hue_api._is_unreachable(urllib.error.URLError("refused")))
+        self.assertTrue(hue_api._is_unreachable(TimeoutError()))
+        self.assertFalse(hue_api._is_unreachable(
+            urllib.error.HTTPError("u", 403, "no", {}, None)))
+        self.assertFalse(hue_api._is_unreachable(ValueError("bad json")))
+
+    def test_finds_new_ip_for_matching_bridge_id(self):
+        with self.discovery([{"id": self.BRIDGE_ID.upper(),
+                              "internalipaddress": "192.168.1.5"}]):
+            self.assertEqual(hue_api._rediscover_bridge_ip(self.creds()), "192.168.1.5")
+
+    def test_ignores_other_bridges_and_unchanged_or_public_addresses(self):
+        for entry in (
+            {"id": "0000000000000000", "internalipaddress": "192.168.1.9"},
+            {"id": self.BRIDGE_ID, "internalipaddress": "192.168.1.4"},
+            {"id": self.BRIDGE_ID, "internalipaddress": "8.8.8.8"},
+            {"id": self.BRIDGE_ID, "internalipaddress": "not-an-ip"},
+        ):
+            os.path.exists(self.tmp.name)
+            stamp = os.path.join(self.tmp.name, "omarchy/settings/hue-discovery.stamp")
+            if os.path.exists(stamp):
+                os.unlink(stamp)
+            with self.discovery([entry]):
+                self.assertIsNone(hue_api._rediscover_bridge_ip(self.creds()), entry)
+
+    def test_no_lookup_without_a_bridge_id(self):
+        self.write_creds({"bridgeIp": "192.168.1.4", "username": "u"})
+        with self.discovery([{"id": self.BRIDGE_ID,
+                              "internalipaddress": "192.168.1.5"}]) as urlopen:
+            self.assertIsNone(hue_api._rediscover_bridge_ip(self.creds()))
+            urlopen.assert_not_called()
+
+    def test_lookups_are_rate_limited(self):
+        entries = [{"id": self.BRIDGE_ID, "internalipaddress": "192.168.1.5"}]
+        with self.discovery(entries) as urlopen:
+            hue_api._rediscover_bridge_ip(self.creds())
+            self.assertIsNone(hue_api._rediscover_bridge_ip(self.creds()))
+            self.assertEqual(urlopen.call_count, 1)
+
+    def test_discovery_failure_is_silent(self):
+        with mock.patch.object(hue_api.urllib.request, "urlopen",
+                               side_effect=urllib.error.URLError("offline")):
+            self.assertIsNone(hue_api._rediscover_bridge_ip(self.creds()))
+
+    def test_save_changes_only_the_ip(self):
+        hue_api._save_bridge_ip("192.168.1.5")
+        self.assertEqual(self.creds(), {"bridgeIp": "192.168.1.5",
+                                        "bridgeId": self.BRIDGE_ID, "username": "u"})
+        self.assertEqual(stat.S_IMODE(os.stat(self.creds_path).st_mode), 0o600)
+
+    def test_dispatch_retries_at_new_ip_and_saves_it_only_on_success(self):
+        seen = []
+
+        def fake_run(op, creds):
+            seen.append(creds["bridgeIp"])
+            if creds["bridgeIp"] == "192.168.1.4":
+                raise urllib.error.URLError("no route")
+
+        with mock.patch.object(hue_api, "_run_bridge_op", fake_run), \
+                mock.patch.object(hue_api, "_rediscover_bridge_ip",
+                                  return_value="192.168.1.5"):
+            hue_api._dispatch("get-groups")
+        self.assertEqual(seen, ["192.168.1.4", "192.168.1.5"])
+        self.assertEqual(self.creds()["bridgeIp"], "192.168.1.5")
+
+    def test_dispatch_keeps_old_ip_when_new_one_also_fails(self):
+        def fake_run(op, creds):
+            raise urllib.error.URLError("no route")
+
+        with mock.patch.object(hue_api, "_run_bridge_op", fake_run), \
+                mock.patch.object(hue_api, "_rediscover_bridge_ip",
+                                  return_value="192.168.1.5"):
+            with self.assertRaises(SystemExit):
+                hue_api._dispatch("get-groups")
+        self.assertEqual(self.creds()["bridgeIp"], "192.168.1.4")
+
+
 if __name__ == "__main__":
     unittest.main()
